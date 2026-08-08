@@ -31,18 +31,57 @@ deployable (if blank) front end.
 
 ## Phase 1 — Schema build-out
 
-- Apply `synerdgy-schema-v2.sql` as a starting migration.
-- Add the tables/columns identified as missing during design:
-  - `sessions`/`parties` table for the session-per-match model (README
-    item 1) — this is the foundation the rest of the app hangs off, so
-    it needs to exist before any upload logic is wired up.
-  - `match_scope` (`organisation | contact`) and `site_match`
-    (`none | partial | full`) columns on `match_records`.
-  - Any column needed to carry the embedded `session_id` check described
-    in the spec (§8) — likely just referencing the existing session/party
-    row rather than a new column.
-- Set up RLS policies for the new tables, consistent with the existing
-  ones in the v2 schema.
+**Update (8 Aug 2026):** `synerdgy-schema-v2.sql` was reviewed against
+the Exchange spec. It's the right starting point (hash columns, index
+strategy, and RLS pattern all carry over) but its core structure is
+built for v2's actual use case — one client, one project, multiple of
+their own sources compared pairwise against each other via
+`source_pairs`/`pair_results`. Exchange is a fixed two-party model, not
+a configurable N-source one, so this needs real restructuring, not just
+additive columns. Decided shape:
+
+- **`matches`** replaces `projects` — one row per Exchange session.
+  Columns: `id`, `match_type` (1 | 2, spec §2), `designated_viewer_party_id`,
+  `status`, `created_at`.
+- **`parties`** — new table, exactly two rows per match. Columns: `id`,
+  `match_id`, `role` (`licensor` | `invitee`), `slot` (1 | 2), `user_id`
+  (licensor — standard Supabase Auth) or `magic_link_token` (invitee —
+  single-use, scoped to this match only), `email`, `done_at` (set by the
+  explicit "Done" action, spec §3 steps 4–5/7).
+- **`sources`** replaces `project_sources` — scoped to a `party_id`
+  rather than a `project_id`. Adds `file_seq` (assigned at queue-entry
+  per spec §3a, not at processing-completion) and `status`
+  (`queued | processing | acknowledged`) to support concurrent
+  per-file processing.
+- **`company_hashes` / `contact_hashes`** — same hash columns as v2.
+  `client_record_id` widens from `char(24)` to fit the new `fileSeq`
+  segment in the SYN ID format (spec §4: `SYN-[project]-[client]-
+  [fileSeq]-[recordSeq]`) — this is a breaking format change from v2's
+  `SYN-A3F7C-2A9F1-0000A3B4` shape, not an additive one. Links to
+  `source_id` (and `party_id`) instead of `project_id`.
+- **`match_records`** — keyed directly by `match_id` (no `source_pairs`
+  indirection needed for a fixed two-party model). Adds `match_scope`
+  (`organisation | contact`) and `site_match` (`none | partial | full`,
+  organisation rows only, null for contact rows) per spec §6.
+- **Dropped from v2:** `source_pairs` and `pair_results` — that
+  configurability (multiple sources per client, user-selected pairing)
+  doesn't apply to Exchange's fixed two-party flow. Their aggregate-count
+  role is replaced by a simpler per-match Venn query (spec §7) computed
+  directly off `match_records`.
+- **`session_id` validation** (spec §8) — no new column needed; the
+  match's own `id` serves as the session ID embedded in the mapping
+  file header.
+
+RLS moves from v2's token-only pattern (`current_setting('app.access_token')`)
+to a role-aware model distinguishing licensor auth (standard Supabase
+Auth session) from invitee auth (magic-link token scoped to exactly one
+`match_id`) — v2's policies assumed a single access path per project,
+which doesn't hold once two independently-authenticated parties share
+one match row.
+
+**Still to do:** write the actual `CREATE TABLE` migration SQL and RLS
+policies against this shape — deferred to next session rather than
+rushed.
 
 **Output:** a live database matching the design spec, not just the
 original engine pack.
