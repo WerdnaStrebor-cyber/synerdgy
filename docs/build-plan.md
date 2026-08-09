@@ -125,6 +125,35 @@ before a licensor's first match exists. Fine for testing the flow
 end-to-end; needs a real fix (likely a `clients.owner_user_id` column)
 before this handles repeat real licensors.
 
+**Update (9 Aug 2026, post-build testing):** three real bugs surfaced
+testing the create-match flow end to end, all fixed and confirmed
+working:
+
+1. **`clients` RLS chicken-and-egg.** The original SELECT policy proved
+   ownership only via an existing `parties` row — didn't exist yet on a
+   licensor's first-ever client row, so the insert's `.select()` failed.
+   Fixed with a direct `clients.created_by` column and ownership-based
+   policy — this also closed the "new clients row on every match"
+   duplication gap noted below, since `CreateMatchForm` now looks up an
+   existing client by `created_by` before creating a new one.
+2. **Same chicken-and-egg one step further down, on `matches`.** Fixed by
+   adding a second SELECT policy allowing access via `clients` ownership,
+   not just via an existing `parties` row.
+3. **Infinite recursion in `has_match_access`/`is_own_party`.** Both
+   functions query the `parties` table internally, but were also used
+   inside `parties`' own RLS policy — the internal query re-triggered the
+   same policy, calling the function again, forever, until Postgres hit
+   "stack depth limit exceeded". Fixed by marking both `SECURITY DEFINER`
+   so the internal lookup bypasses RLS — same pattern already used
+   correctly on `validate_invitee_access`. This bug existed since Phase 1
+   but wasn't exercised until Phase 2 actually read a `parties` row back
+   after insert.
+
+Also fixed: the `magic_link_token` column's `default gen_random_uuid()`
+was firing on the licensor's party insert too, not just the invitee's —
+violated the `parties_auth_matches_role` check constraint. Fixed by
+explicitly passing `magic_link_token: null` on the licensor insert.
+
 **Also still open:** the actual upload flow (Phase 3/4) will need to
 decide how an invitee's requests carry their identity on every single
 call, given Supabase's connection pooling doesn't guarantee the
