@@ -3,15 +3,10 @@
 // name/email. On submit, this creates the client/match/parties rows and
 // surfaces the magic link for the licensor to send manually.
 //
-// KNOWN GAP, flagged deliberately rather than hidden: this creates a new
-// `clients` row on every single match, rather than reusing one client
-// record across a licensor's repeat matches. There's no clean way yet for
-// the app to look up "this licensor's existing client row" — clients
-// isn't linked to auth.uid() directly, only indirectly through an
-// existing match's party row, which doesn't exist yet on a licensor's
-// very first match. Fine for testing Phase 2 end-to-end; worth a proper
-// fix (e.g. a clients.owner_user_id column) before this handles repeat
-// real licensors.
+// Reuses an existing client row for this licensor if one exists (found
+// via clients.created_by), rather than creating a new one on every
+// match — fixed 9 Aug 2026 alongside the RLS chicken-and-egg bug this
+// used to hit on a licensor's very first match.
 import { useState } from 'react'
 import { supabase } from '../../lib/supabaseClient'
 import { generateHexCode } from '../../lib/generateCode'
@@ -31,13 +26,25 @@ export function CreateMatchForm({ session }) {
     setSubmitting(true)
 
     try {
-      // 1. Client record — see the KNOWN GAP note above.
-      const { data: client, error: clientError } = await supabase
+      // 1. Reuse this licensor's existing client row if they have one.
+      const { data: existingClient, error: lookupError } = await supabase
         .from('clients')
-        .insert({ name: matchName, client_code: generateHexCode() })
         .select()
-        .single()
-      if (clientError) throw clientError
+        .eq('created_by', session.user.id)
+        .limit(1)
+        .maybeSingle()
+      if (lookupError) throw lookupError
+
+      let client = existingClient
+      if (!client) {
+        const { data: newClient, error: clientError } = await supabase
+          .from('clients')
+          .insert({ name: session.user.email, client_code: generateHexCode(), created_by: session.user.id })
+          .select()
+          .single()
+        if (clientError) throw clientError
+        client = newClient
+      }
 
       // 2. The match itself.
       const { data: match, error: matchError } = await supabase
