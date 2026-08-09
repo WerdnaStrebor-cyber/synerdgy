@@ -99,14 +99,41 @@ original engine pack.
 
 ## Phase 2 — Auth: two login paths
 
-- Standard login (licensor) — username + hashed password check. This is
-  ordinary auth work, lowest risk in the whole plan.
-- Magic link (invitee) — passwordless, single-use, tied to a specific
-  match/session rather than a persistent account. Needs to be scoped so
-  a magic link only grants access to *that* match, nothing else.
-- Match-type selection (Type 1 / Type 2, per spec §2) needs to exist
-  before either login path is meaningful, since it determines who gets
-  which.
+**Update (9 Aug 2026):** built and working — `LoginForm.jsx` (licensor,
+standard Supabase Auth email/password), `CreateMatchForm.jsx` (licensor
+creates a match, picks type, invites by name/email, gets back a magic
+link to send manually), `InviteLanding.jsx` (invitee's landing page at
+`/invite/:token`, validates the token via the new `invitee_get_match`
+RPC and shows match name + their party slot). Routing added via
+react-router-dom.
+
+Two gaps found and fixed along the way that Phase 1 had missed:
+- **No INSERT policies existed** on `matches`, `parties`, or `clients` —
+  Phase 1 only wrote SELECT/UPDATE, so no one could actually create a
+  match. Fixed with `clients_insert_own`, `matches_insert_authenticated`,
+  `parties_insert_own_match_setup` (the latter ownership-checked so a
+  licensor can only insert a party row as themselves).
+- **`invitee_get_match(token)` RPC added** — read-only, `SECURITY
+  DEFINER`, returns only match name/type/status and the invitee's own
+  party details. No hash tables touched.
+
+**Known gap, deliberately not fixed today:** `CreateMatchForm` creates a
+brand-new `clients` row on every single match rather than reusing one
+client record per licensor across repeat matches — there's no column
+linking `clients` to `auth.uid()` yet, and no clean way to look one up
+before a licensor's first match exists. Fine for testing the flow
+end-to-end; needs a real fix (likely a `clients.owner_user_id` column)
+before this handles repeat real licensors.
+
+**Also still open:** the actual upload flow (Phase 3/4) will need to
+decide how an invitee's requests carry their identity on every single
+call, given Supabase's connection pooling doesn't guarantee the
+`current_setting('app.party_id')` pattern used in Phase 1's RLS persists
+across requests. Options to weigh then: routing invitee writes through
+`SECURITY DEFINER` RPC functions (token passed as an explicit argument
+each call — sidesteps the pooling issue entirely) versus a PostgREST
+pre-request hook. Not resolved here — Phase 2 only needed read-only
+invitee access, which the RPC pattern already handles fine.
 
 **Output:** a licensor can log in; an invited party can access their
 match via a magic link; the system knows which type of match this is.
