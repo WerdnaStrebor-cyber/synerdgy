@@ -70,6 +70,9 @@ export function CreateMatchForm({ session }) {
         role: 'licensor',
         slot: licensorSlot,
         user_id: session.user.id,
+        magic_link_token: null, // column has a default for the invitee row's
+                                 // benefit — must override it here, since
+                                 // licensor rows require this to be null
         email: session.user.email,
       })
       if (licensorPartyError) throw licensorPartyError
