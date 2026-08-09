@@ -79,9 +79,20 @@ Auth session) from invitee auth (magic-link token scoped to exactly one
 which doesn't hold once two independently-authenticated parties share
 one match row.
 
-**Still to do:** write the actual `CREATE TABLE` migration SQL and RLS
-policies against this shape — deferred to next session rather than
-rushed.
+**Update (9 Aug 2026):** migration applied to the live Supabase project
+(`supabase/migrations/20260809150921_exchange_schema.sql`). All 7 tables
+live with RLS enabled. One refinement made during review, not in the
+original plan above: `company_hashes`/`contact_hashes` are **insert-only**
+for both parties — no client-side read/update/delete use case exists,
+since the app never needs to read raw hash values back (upload progress
+comes from `sources.company_count`/`contact_count`, plain integers). Only
+the Phase 5 matching RPCs (running as `SECURITY DEFINER`) ever read these
+tables. Ran Supabase's security advisor post-migration — caught mutable
+`search_path` on the three helper functions (a schema-shadowing privilege
+escalation vector), fixed by pinning `set search_path = public` on each.
+Advisor is clean now bar two expected warnings on `validate_invitee_access`
+being publicly callable, which is correct by design — it has to be
+callable by an unauthenticated invitee holding only a magic-link token.
 
 **Output:** a live database matching the design spec, not just the
 original engine pack.
