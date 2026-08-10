@@ -43,15 +43,18 @@
  *     present, leading '00' collapsed to '+'. No further validation —
  *     malformed numbers just hash to a value nothing else matches,
  *     which is the correct failure mode (no match) rather than an error.
- *   Deeper contact matching logic (nickname normalisation, consonant
- *   skeletons for contact_fuzzy) lives entirely in the M2 SQL per spec
- *   §6 — not duplicated here.
+ *   - firstNameCanonical: resolved via synerdgy-firstname-canonicaliser.js
+ *     against the nicknames.csv lookup table (10 Aug 2026) — supports
+ *     the contact_name match level (spec §6). Consonant-skeleton
+ *     matching (contact_fuzzy) remains parked, per product owner
+ *     instruction — no code here for that yet.
  */
 
 import * as SynerdgyVHC from './synerdgy-vhc-normalizer.js';
 import * as SynerdgyCountry from './synerdgy-country-standardiser.js';
 import * as SynerdgyPostcode from './synerdgy-postcode-normaliser.js';
 import * as SynerdgyHashPipeline from './synerdgy-hash-pipeline.js';
+import { FirstnameCanonicaliser } from './synerdgy-firstname-canonicaliser.js';
 
 const HASH_BATCH_SIZE = 500;
 
@@ -182,6 +185,7 @@ function _deriveFromRow(record, mapping, fileSeq, recordSeq) {
     emailName,
     emailDomain,
     firstNameStandardised:  firstName,
+    firstNameCanonical:     FirstnameCanonicaliser.canonicalise(firstName, _tables),
     firstNameInitial:       firstName ? firstName.charAt(0).toUpperCase() : '',
     surnameStandardised:    surname,
     telephoneStandardised:  _standardiseTelephone(telephone),

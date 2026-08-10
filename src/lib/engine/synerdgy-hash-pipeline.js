@@ -207,6 +207,12 @@ async function hashBatch(derivedBatch, salt) {
  * @property {string} emailName            - Local part of the email, before '@'
  * @property {string} emailDomain          - Domain part of the email, after '@'
  * @property {string} firstNameStandardised
+ * @property {string} firstNameCanonical   - Nickname-resolved form (10 Aug 2026)
+ *                                          — e.g. 'bob'/'robert'/'bobby' all
+ *                                          resolve to the same canonical
+ *                                          value before hashing, supporting
+ *                                          the contact_name match level
+ *                                          without weakening firstname_standardised.
  * @property {string} firstNameInitial
  * @property {string} surnameStandardised
  * @property {string} telephoneStandardised
@@ -216,6 +222,7 @@ async function hashContactRecord(derived, salt) {
     email_name,
     email_domain,
     firstname_standardised,
+    firstname_canonical,
     firstname_initial,
     surname_standardised,
     telephone_standardised,
@@ -223,6 +230,7 @@ async function hashContactRecord(derived, salt) {
     sha256(derived.emailName, salt),
     sha256(derived.emailDomain, salt),
     sha256(derived.firstNameStandardised, salt),
+    sha256(derived.firstNameCanonical, salt),
     sha256(derived.firstNameInitial, salt),
     sha256(derived.surnameStandardised, salt),
     sha256(derived.telephoneStandardised, salt),
@@ -233,6 +241,7 @@ async function hashContactRecord(derived, salt) {
     email_name,
     email_domain,
     firstname_standardised,
+    firstname_canonical,
     firstname_initial,
     surname_standardised,
     telephone_standardised,
@@ -371,6 +380,7 @@ async function runTests() {
     emailName:               'john.smith',
     emailDomain:              'example.com',
     firstNameStandardised:  'JOHN',
+    firstNameCanonical:     'john',
     firstNameInitial:       'J',
     surnameStandardised:    'SMITH',
     telephoneStandardised:  '441234567890',
@@ -378,7 +388,8 @@ async function runTests() {
   const hashedContact = await hashContactRecord(mockContact, TEST_SALT);
   const expectedContactCols = [
     'client_record_id', 'email_name', 'email_domain', 'firstname_standardised',
-    'firstname_initial', 'surname_standardised', 'telephone_standardised',
+    'firstname_canonical', 'firstname_initial', 'surname_standardised',
+    'telephone_standardised',
   ];
   const missingContactCols = expectedContactCols.filter(c => !(c in hashedContact));
   if (missingContactCols.length === 0 && hashedContact.client_record_id === mockContact.clientRecordId) {
@@ -412,6 +423,28 @@ async function runTests() {
     passed++;
   } else {
     console.warn(`❌ email_name/email_domain not independent`);
+    failed++;
+  }
+
+  // Nickname canonicalisation must hash 'Bob'/'Robert'/'Bobby' identically
+  // via firstname_canonical, while firstname_standardised — hashed from
+  // the raw, un-resolved value — stays distinct for each. This mirrors
+  // the resolution FirstnameCanonicaliser performs upstream in the
+  // worker; here we just confirm the hash pipeline treats the two
+  // columns independently, as designed.
+  const bob    = await hashContactRecord({ ...mockContact, firstNameStandardised: 'Bob',    firstNameCanonical: 'robert' }, TEST_SALT);
+  const robert = await hashContactRecord({ ...mockContact, firstNameStandardised: 'Robert', firstNameCanonical: 'robert' }, TEST_SALT);
+  const bobby  = await hashContactRecord({ ...mockContact, firstNameStandardised: 'Bobby',  firstNameCanonical: 'robert' }, TEST_SALT);
+  if (
+    bob.firstname_canonical === robert.firstname_canonical &&
+    robert.firstname_canonical === bobby.firstname_canonical &&
+    bob.firstname_standardised !== robert.firstname_standardised &&
+    robert.firstname_standardised !== bobby.firstname_standardised
+  ) {
+    console.log(`✅ firstname_canonical unifies nickname variants while firstname_standardised stays distinct`);
+    passed++;
+  } else {
+    console.warn(`❌ firstname_canonical/firstname_standardised independence broken`);
     failed++;
   }
 

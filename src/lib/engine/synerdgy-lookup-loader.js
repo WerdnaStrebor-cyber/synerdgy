@@ -22,6 +22,11 @@
  *   countries_lookup.txt      — Standard name → ISO-2 map (TSV)
  *   zip_patterns.txt          — Postcode prefix patterns (TSV)
  *   free_domains.csv          — Free email domain blocklist (one per line)
+ *   nicknames.csv             — 10 Aug 2026: canonical/nickname map for
+ *                                the contact_name match level (CSV,
+ *                                header `canonical,nickname`). Its
+ *                                absence fails the whole load, same as
+ *                                any other lookup file — not optional.
  *
  * Usage:
  *   const tables = await LookupLoader.load(supabase);
@@ -67,6 +72,18 @@ class LookupTables {
     // freeDomains: Set<string(lowercase domain)>
     this.freeDomains = new Set();
 
+    // Nickname canonicalisation (10 Aug 2026 — synerdgy-firstname-canonicaliser.js)
+    // canonicalNames: Set<string(lowercase)> — every name that appears in
+    //   the canonical column, checked BEFORE nickname lookup (fixes the
+    //   `sandra` case: canonical in its own right AND a nickname of
+    //   `alexandra`).
+    // nicknameToCanonicals: Map<string(lowercase nickname), string[]> —
+    //   candidate canonicals, sorted alphabetically at parse time so
+    //   ambiguous nicknames (chris/nicky/nat/katie/kathy/kate) resolve
+    //   deterministically without re-sorting on every lookup.
+    this.canonicalNames = new Set();
+    this.nicknameToCanonicals = new Map();
+
     // Load diagnostics — available after load() completes
     this.diagnostics = {
       wordHandlingRules: 0,
@@ -76,6 +93,8 @@ class LookupTables {
       countryIso2Mappings: 0,
       postcodePrefixes: 0,
       freeDomains: 0,
+      nicknameEntries: 0,
+      nicknameCanonicals: 0,
       compiledPasses: 0,
       warnings: [],
     };
@@ -106,6 +125,7 @@ class LookupLoader {
       ['countries_lookup.txt',       'COUNTRIES_LOOKUP'],
       ['zip_patterns.txt',           'ZIP_PATTERNS'],
       ['free_domains.csv',           'FREE_DOMAINS'],
+      ['nicknames.csv',              'NICKNAMES'],
     ];
 
     // Fetch all files in parallel
@@ -126,6 +146,7 @@ class LookupLoader {
       countriesRaw,
       zipPatternsRaw,
       freeDomainsRaw,
+      nicknamesRaw,
     ] = rawFiles;
 
     // Parse each file
@@ -136,6 +157,7 @@ class LookupLoader {
     LookupLoader._parseCountriesLookup(countriesRaw, tables);
     LookupLoader._parseZipPatterns(zipPatternsRaw, tables);
     LookupLoader._parseFreeDomains(freeDomainsRaw, tables);
+    LookupLoader._parseNicknames(nicknamesRaw, tables);
 
     // Pre-compile word handling passes (pay cost once)
     LookupLoader._compilePasses(tables);
@@ -432,6 +454,63 @@ class LookupLoader {
   }
 
   // -------------------------------------------------------------------------
+  // nicknames.csv parser (10 Aug 2026)
+  //
+  // Format: CSV with header row, columns `canonical,nickname` (order
+  // located from header, same defensive pattern as PS_Ctry_Stand/
+  // countries_lookup — falls back to columns 0,1 if headers don't match
+  // exactly). One canonical can have many nickname rows; one nickname
+  // can map to several canonicals (the genuinely ambiguous case) — all
+  // candidates are collected, then sorted alphabetically once here so
+  // FirstnameCanonicaliser never has to re-sort on every lookup.
+  //
+  // `canonicalNames` collects every distinct value seen in the
+  // canonical column — checked first by the canonicaliser so a name
+  // that is both canonical and someone else's nickname (e.g. `sandra`)
+  // always resolves to itself.
+  // -------------------------------------------------------------------------
+
+  static _parseNicknames(raw, tables) {
+    const lines = raw.split(/\r?\n/);
+    let headerParsed = false;
+    let canonicalIdx = 0, nicknameIdx = 1;
+    const pending = new Map(); // nickname -> Set<canonical>, deduped before sort
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+
+      const parts = LookupLoader._parseCsvLine(line);
+
+      if (!headerParsed) {
+        const headers = parts.map(h => h.replace(/^"|"$/g, '').trim().toUpperCase());
+        canonicalIdx = headers.indexOf('CANONICAL');
+        nicknameIdx  = headers.indexOf('NICKNAME');
+        if (canonicalIdx === -1) canonicalIdx = 0;
+        if (nicknameIdx  === -1) nicknameIdx  = 1;
+        headerParsed = true;
+        continue;
+      }
+
+      const canonical = (parts[canonicalIdx] ?? '').replace(/^"|"$/g, '').trim().toLowerCase();
+      const nickname  = (parts[nicknameIdx]  ?? '').replace(/^"|"$/g, '').trim().toLowerCase();
+
+      if (!canonical || !nickname) continue;
+
+      tables.canonicalNames.add(canonical);
+
+      if (!pending.has(nickname)) pending.set(nickname, new Set());
+      pending.get(nickname).add(canonical);
+    }
+
+    for (const [nickname, canonicalSet] of pending) {
+      tables.nicknameToCanonicals.set(nickname, [...canonicalSet].sort());
+    }
+
+    tables.diagnostics.nicknameCanonicals = tables.canonicalNames.size;
+    tables.diagnostics.nicknameEntries    = tables.nicknameToCanonicals.size;
+  }
+
+  // -------------------------------------------------------------------------
   // Pass pre-compilation
   //
   // Mirrors Python FastOrganisationNormalizer._compile_passes().
@@ -545,6 +624,8 @@ function logLookupDiagnostics(tables) {
   console.log(`ISO-2 mappings loaded:       ${d.countryIso2Mappings}`);
   console.log(`Postcode prefixes loaded:    ${d.postcodePrefixes}`);
   console.log(`Free domains loaded:         ${d.freeDomains}`);
+  console.log(`Canonical names loaded:      ${d.nicknameCanonicals}`);
+  console.log(`Nickname entries loaded:     ${d.nicknameEntries}`);
   console.log(`Compiled passes:             ${d.compiledPasses}`);
   if (d.warnings.length > 0) {
     console.warn('Warnings:', d.warnings);

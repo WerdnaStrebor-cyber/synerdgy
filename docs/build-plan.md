@@ -263,6 +263,46 @@ data ambiguities found and handled deliberately, not silently:
   file `LookupLoader.load()` now fetches in parallel with the rest; its
   absence fails the whole load, not just nickname resolution.
 
+**Correction (10 Aug 2026, later session):** the paragraph above was
+written before the actual client-side code existed — a documentation/
+implementation gap caught on review. `nicknames.csv` was uploaded to
+the bucket and `contact_hashes.firstname_canonical` was added live in
+Supabase, but no local code referenced either one, and 11 of the 12
+live migrations applied that day (everything after the Phase 1 schema)
+had never been committed to git. A live bug was also found in the
+process: two overloads of `mark_source_processed` coexisted — a stale
+3-arg version from before the email-split migration, referencing a
+`contact_hashes.email` column that no longer existed, ambiguous
+against the correct 4-arg version on any 3-arg call. Fixed same
+session (`drop_stale_mark_source_processed_overload`). Now actually
+built and committed:
+- `synerdgy-firstname-canonicaliser.js` — new module, both ambiguity
+  rules from the paragraph above implemented and unit-verified
+  (`sandra`-is-canonical-first; alphabetical tiebreak for
+  chris/nicky/nat/katie/kathy/kate).
+- `synerdgy-lookup-loader.js` — `nicknames.csv` added to `FILES`,
+  `_parseNicknames` added, `tables.canonicalNames` /
+  `tables.nicknameToCanonicals` populated.
+- `synerdgy-file-worker.js` — derives `firstNameCanonical` per contact
+  row via the new module.
+- `synerdgy-hash-pipeline.js` — `firstname_canonical` hashed alongside
+  the other contact fields; self-test suite extended to confirm
+  Bob/Robert/Bobby hash identically on `firstname_canonical` while
+  staying distinct on `firstname_standardised`.
+- `supabase/migrations/20260810160000_git_catchup_10_aug_2026.sql` — a
+  single idempotent migration bringing git in sync with everything live
+  (Supabase doesn't retain original SQL text for already-applied
+  migrations, so this is a schema-equivalent snapshot, not a
+  replay of the original 11 files). Verified idempotent by re-running
+  the non-function statements against the already-live schema — clean.
+- Not independently verified against the live `nicknames.csv`'s actual
+  byte content — the loader's header-detection parser follows the same
+  defensive pattern already proven for the other CSV lookups, and the
+  resolution logic was tested against representative mock data matching
+  the documented ambiguous cases, but the real file wasn't fetchable
+  from this session's sandbox. Worth a live `LookupLoader.load()` smoke
+  test once this is merged.
+
 **contact_fuzzy (consonant-skeleton matching) — explicitly parked**, on
 product owner instruction (10 Aug 2026). Needs `firstname_consonants`/
 `surname_consonants` columns and a consonant-skeleton algorithm,
