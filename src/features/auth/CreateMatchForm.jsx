@@ -10,6 +10,7 @@
 import { useState } from 'react'
 import { supabase } from '../../lib/supabaseClient'
 import { generateHexCode } from '../../lib/generateCode'
+import { UploadFlow } from '../upload/UploadFlow'
 
 export function CreateMatchForm({ session }) {
   const [matchName, setMatchName] = useState('')
@@ -19,6 +20,9 @@ export function CreateMatchForm({ session }) {
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
   const [magicLink, setMagicLink] = useState(null)
+  const [createdMatch, setCreatedMatch] = useState(null) // { id, match_code } — needed to hand into UploadFlow
+  const [createdClient, setCreatedClient] = useState(null) // { client_code }
+  const [uploading, setUploading] = useState(false)
 
   async function handleSubmit(e) {
     e.preventDefault()
@@ -93,11 +97,23 @@ export function CreateMatchForm({ session }) {
       if (inviteePartyError) throw inviteePartyError
 
       setMagicLink(`${window.location.origin}/invite/${inviteeParty.magic_link_token}`)
+      setCreatedMatch(match)
+      setCreatedClient(client)
     } catch (err) {
       setError(err.message)
     } finally {
       setSubmitting(false)
     }
+  }
+
+  if (uploading) {
+    return (
+      <UploadFlow
+        matchId={createdMatch.id}
+        projectCode={createdMatch.match_code}
+        clientCode={createdClient.client_code}
+      />
+    )
   }
 
   if (magicLink) {
@@ -110,6 +126,11 @@ export function CreateMatchForm({ session }) {
           yourself.
         </p>
         <input readOnly value={magicLink} style={{ width: '100%' }} onFocus={(e) => e.target.select()} />
+        <p style={{ marginTop: 16 }}>
+          If your match type has you uploading first, you can start now —
+          otherwise, wait for your invitee to finish and come back here.
+        </p>
+        <button onClick={() => setUploading(true)}>Start uploading your files</button>
       </div>
     )
   }

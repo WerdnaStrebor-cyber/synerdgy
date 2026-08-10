@@ -93,6 +93,12 @@ class Orchestrator {
     clientCode,
     defaultCountry  = 'GB',
     workerPoolSize  = WORKER_POOL_SIZE,
+    inviteeToken    = null, // 10 Aug 2026: set for the invitee path —
+                            // passed through to every RPC call and the
+                            // salt fetch instead of relying on a session
+                            // GUC (see synerdgy-hash-pipeline.js loadSalt
+                            // and the invitee_token_based_auth migration
+                            // for why the GUC approach never worked).
     onQueueChange   = () => {},
     onFileProgress  = () => {},
     onFileReady     = () => {},
@@ -105,6 +111,7 @@ class Orchestrator {
     this.clientCode       = String(clientCode).toUpperCase();
     this.defaultCountry   = defaultCountry.trim().toUpperCase();
     this.workerPoolSize   = workerPoolSize;
+    this.inviteeToken     = inviteeToken;
     this.onQueueChange    = onQueueChange;
     this.onFileProgress   = onFileProgress;
     this.onFileReady       = onFileReady;
@@ -121,7 +128,7 @@ class Orchestrator {
   // -------------------------------------------------------------------------
 
   async init() {
-    this._salt = await SynerdgyHashPipeline.loadSalt(this.supabase, this.matchId);
+    this._salt = await SynerdgyHashPipeline.loadSalt(this.supabase, this.matchId, this.inviteeToken);
 
     for (let i = 0; i < this.workerPoolSize; i++) {
       const worker = new Worker(new URL('./synerdgy-file-worker.js', import.meta.url), { type: 'module' });
@@ -199,6 +206,7 @@ class Orchestrator {
       p_match_id: this.matchId,
       p_filename: pending.file.name,
       p_source_type: ext,
+      p_invitee_token: this.inviteeToken,
     });
     if (error) throw new Error(`queue_source_upload failed: ${error.message}`);
 
@@ -293,6 +301,7 @@ class Orchestrator {
           p_company_records: msg.companyBatch,
           p_contact_records: msg.contactBatch,
           p_final: msg.isFinal,
+          p_invitee_token: this.inviteeToken,
         });
         if (error) throw new Error(error.message);
       } catch (err) {
@@ -337,7 +346,10 @@ class Orchestrator {
       throw new Error(`Orchestrator: source ${sourceId} is not ready (status: ${job.status})`);
     }
 
-    const { error } = await this.supabase.rpc('acknowledge_source', { p_source_id: sourceId });
+    const { error } = await this.supabase.rpc('acknowledge_source', {
+      p_source_id: sourceId,
+      p_invitee_token: this.inviteeToken,
+    });
     if (error) throw new Error(`acknowledge_source failed: ${error.message}`);
 
     job.status = STATES.ACKNOWLEDGED;

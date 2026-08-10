@@ -401,6 +401,77 @@ exists yet) and the dual-acknowledgement gate UI itself (`acknowledgeFile`
 already exists in the orchestrator from Phase 3; nothing yet calls it
 from a real "I've saved both files" confirmation control).
 
+**Upload UI built (10 Aug 2026, later same day).** `UploadFlow.jsx` —
+one component, works for both parties via an `inviteeToken` prop
+(licensor omits it, invitee passes theirs). Wired into both entry
+points: `InviteLanding.jsx` (invitee, behind a "start uploading" button
+after the invite-confirmation screen) and `CreateMatchForm.jsx`
+(licensor, behind the same button after match creation — needed
+`createdMatch`/`createdClient` kept in state, previously discarded once
+the magic link was shown). Verified through the real Vite/React build,
+not just `node --check` — 80 modules transform cleanly, oxlint clean
+on every touched file, and the worker chunk splits out correctly,
+confirming the `new Worker(new URL(...), { type: 'module' })` pattern
+still resolves with the new wiring in place.
+
+**A production-breaking gap was found and fixed before any of this
+could actually work, not part of the plan going in.** `current_party_id`
+and `is_own_party`'s invitee branch relied on
+`current_setting('app.party_id', true)` — a session GUC nothing
+client-side has ever set, and which magic-link (non-Auth-session)
+invitees have no mechanism to set at all across separate stateless
+PostgREST requests. Verified live: the GUC reads `null` on a genuinely
+separate call. Every invitee-facing RPC (`queue_source_upload`,
+`mark_source_processed`, `acknowledge_source`) and the direct salt
+fetch would have failed "not authorized" for every real invitee, every
+time — despite passing the Phase 3 "end to end" test, which had bundled
+`set_config` into the *same* `execute_sql` call as the RPC, a trick a
+real browser request can't replicate.
+
+Fixed by threading an explicit invitee token through instead of relying
+on ambient session state — same pattern `invitee_get_match` already
+used correctly:
+- The three orchestrator RPCs gained a `p_invitee_token` parameter,
+  checked directly against `parties.magic_link_token` inline (not via a
+  shared helper — see below for why).
+- New `get_match_salt(p_token)` RPC — invitees no longer go through the
+  RLS-gated direct `matches` select `loadSalt()` used for licensors.
+- `invitee_get_match` extended to also return `match_code`/`client_code`
+  — the invitee had no other RLS-safe way to get the values
+  `projectCode`/`clientCode` (spec §4's SYN ID format) need. Return-type
+  changes aren't possible via `CREATE OR REPLACE` — this one was
+  drop-then-create, not an additive change.
+- `synerdgy-hash-pipeline.js`'s `loadSalt()` and `synerdgy-orchestrator.js`
+  gained an `inviteeToken` parameter, threaded from the constructor
+  down through every RPC call and the salt fetch.
+
+**Caught and fixed the same overload trap twice more while doing this**
+(same class of bug as `drop_stale_mark_source_processed_overload`
+earlier in the day): the first attempt gave `current_party_id`/
+`is_own_party` a second, token-accepting overload — `CREATE OR REPLACE`
+with an added parameter creates a *new* overload rather than replacing
+the old one, and RLS policies are pinned to the original 1-arg
+`is_own_party` by OID, so it couldn't even be dropped without cascading
+through five policies. Worse, leaving both in place would have made
+every ordinary 1-arg call — which is all RLS policies ever do — newly
+ambiguous, breaking RLS everywhere, not just the new RPC path. Caught
+immediately by testing the no-token call path right after applying the
+migration, rather than assuming it worked from the positive test alone.
+Corrected by leaving `is_own_party`/`current_party_id` completely
+untouched and inlining the token-check logic directly into the three
+orchestrator RPCs instead — no shared helper, no overload surface at
+all. Re-verified: exactly one signature per function afterward, all
+five RLS policies confirmed still referencing the original untouched
+`is_own_party(uuid)`, and both the positive (real token, separate
+stateless call) and two negative cases (no token; garbage token) tested
+directly against live Supabase, not simulated.
+
+**Still open:** the "Done" button has no RPC to call yet — it just sets
+local UI state. Wiring it to actually trigger the Phase 5 matching run
+is explicitly Phase 5's job, not this one. No results/Venn UI exists
+yet either (Phase 6) — `UploadFlow`'s "done" state is a dead end by
+design until those phases land.
+
 ## Phase 5 — Matching logic
 
 **Update:** the match RPCs have since been recovered in full — M1 (org,

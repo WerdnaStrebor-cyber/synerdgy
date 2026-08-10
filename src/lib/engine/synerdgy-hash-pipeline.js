@@ -59,11 +59,29 @@
  * main thread; the returned value is passed explicitly into worker jobs
  * from there on. Not stored in module state — the caller owns it.
  *
+ * 10 Aug 2026 (upload UI session): the direct `.from('matches').select
+ * ('salt')` only ever worked for a licensor — RLS's matches_party_access
+ * policy resolves via has_match_access(id), which for an invitee
+ * depends on a session GUC (current_setting('app.party_id')) that
+ * nothing client-side can actually set across separate stateless
+ * requests. Invitees now go through the dedicated get_match_salt(token)
+ * RPC instead, which resolves the same way queue_source_upload etc. do
+ * — an explicit token checked directly, not an ambient session var.
+ *
  * @param {SupabaseClient} supabase
  * @param {string} matchId
+ * @param {string|null} inviteeToken - pass for the invitee path; omit/null for licensor.
  * @returns {Promise<string>} the salt UUID
  */
-async function loadSalt(supabase, matchId) {
+async function loadSalt(supabase, matchId, inviteeToken = null) {
+  if (inviteeToken) {
+    const { data, error } = await supabase.rpc('get_match_salt', { p_token: inviteeToken });
+    if (error || !data) {
+      throw new Error(`HashPipeline: failed to load match salt (invitee). ${error?.message ?? 'No salt found.'}`);
+    }
+    return data;
+  }
+
   const { data, error } = await supabase
     .from('matches')
     .select('salt')
