@@ -28,11 +28,12 @@
  *     so canFinish() reflects the real spec §3a rule: all files
  *     acknowledged, not just queue-empty.
  *
- * Explicitly NOT in scope here (Phase 4, per build plan):
+ * Explicitly NOT in scope here:
  *   - Consolidated mapping CSV / lookup workbook generation (spec §5,
- *     §5a). onFileReady/onFileAcknowledged fire with everything Phase 4
- *     needs (fileSeq, filename, mapping, record count) but this class
- *     does not write those files itself.
+ *     §5a) — that's synerdgy-output-writer.js (Phase 4, 10 Aug 2026).
+ *     onFileReady fires with everything it needs (fileSeq, filename,
+ *     mapping, uniqueIds, uploadedAt, rowCount) — call
+ *     `outputWriter.addFile(job)` from your onFileReady handler.
  *
  * Usage:
  *   const session = new Orchestrator({
@@ -61,7 +62,12 @@
 
 'use strict';
 
+import Papa from 'papaparse';
+import * as XLSX from 'xlsx';
 import * as SynerdgyHashPipeline from './synerdgy-hash-pipeline.js';
+// 10 Aug 2026 (Phase 4 session): Papa/XLSX were referenced as bare
+// globals below with no import and no package.json entry — would have
+// thrown ReferenceError at runtime. Both added as real dependencies.
 
 const WORKER_POOL_SIZE = 3; // 10 Aug 2026 decision — see spec §3a. Tunable.
 
@@ -205,6 +211,18 @@ class Orchestrator {
       filename: pending.file.name,
       mapping: confirmedMapping,
       rawRecords: pending.rawRecords,
+      // Lightweight per-row unique_id list, extracted now while
+      // rawRecords is still available — this is ALL Phase 4's output
+      // writer (spec §5/§5a) needs per row, paired positionally with
+      // the deterministic SYN ID (fileSeq + row position, same formula
+      // as synerdgy-file-worker.js's _synId — no need to wait on
+      // hashing or carry the full raw row past dispatch). Kept on the
+      // job even after rawRecords is dropped below, so onFileReady
+      // still has what it needs once processing finishes.
+      uniqueIds: pending.rawRecords.map(
+        r => String(r[confirmedMapping.UNIQUE_ID] ?? '').trim()
+      ),
+      uploadedAt: new Date().toISOString(),
       rowCount: pending.rawRecords.length,
       status: STATES.QUEUED,
     };
@@ -249,7 +267,10 @@ class Orchestrator {
 
     // Raw records now live in the worker's copy (structured clone) —
     // drop the main-thread reference so a large file's rows aren't held
-    // twice in memory for the duration of processing.
+    // twice in memory for the duration of processing. uniqueIds (above)
+    // is NOT dropped — it's the one thing Phase 4's output writer needs
+    // once this job reaches 'ready', and it's a fraction of the size of
+    // the full raw rows.
     nextJob.rawRecords = null;
   }
 

@@ -336,6 +336,71 @@ on old code.
 **Output:** the local file outputs described in the spec, generated
 correctly at every per-file step.
 
+**Started 10 Aug 2026.** Two real gaps found and fixed on the way in,
+before any Phase 4 code was written:
+
+- **`Papa`/`XLSX` were referenced as bare globals in
+  `synerdgy-orchestrator.js`** (`_parseCsv`, `_parseXlsx`) with no
+  import statement and no `package.json` entry for either — would have
+  thrown `ReferenceError` the first time a file was loaded in a real
+  browser. Both added as proper dependencies (`papaparse@^5.5.4`,
+  `xlsx@^0.18.5`) and imported.
+- **`confirmMapping` nulled `job.rawRecords` at dispatch time** (a
+  deliberate Phase 3 memory optimisation — full rows live in the
+  worker's structured clone, no need to hold them twice on the main
+  thread) — but Phase 4's output writer needs each row's `unique_id`
+  value, which only exists in `rawRecords`, and by the time
+  `onFileReady` fires that reference was already gone. Fixed by
+  extracting a lightweight `job.uniqueIds` array (just the ID strings,
+  positionally matched to SYN ID generation) before the full rows are
+  dropped — a fraction of the memory cost of keeping full rows around,
+  and it's the only piece of raw-row data the output writer actually
+  needs. `job.uploadedAt` (ISO timestamp, captured at confirm/queue
+  time) added alongside it.
+
+**`synerdgy-output-writer.js` — new module.** Implements spec §5 (CSV)
+and §5a (workbook) as a standalone class, called from the
+orchestrator's `onFileReady` handler rather than folded into the
+orchestrator itself — keeps the queue/RPC/worker-pool class focused,
+matches the separation the Phase 3 header comment already described.
+
+- **fileSeq-ordered flush queue**, per spec §3a: a file's block isn't
+  written until every lower fileSeq has already flushed, even if it
+  finished processing first. `addFile()` returns which fileSeqs were
+  newly flushed — the caller uses that to know when a file's own
+  re-download/acknowledge prompt (§3f) can actually surface, since the
+  file's rows genuinely aren't in the downloadable CSV until its block
+  flushes. Verified with a real out-of-order test: file 2 added before
+  file 1 flushes nothing until file 1 arrives, then both flush together
+  in the correct order.
+- **SYN IDs are recomputed locally**, not read from the hashed
+  batches — those never carry the plaintext `unique_id` by design (spec
+  §9). Only needs `fileSeq` + row position (same formula as the file
+  worker's `_synId`, duplicated with a comment since the worker module
+  can't cleanly be imported on the main thread) and the lightweight
+  `uniqueIds` array above — doesn't need to wait on hashing to
+  complete at all.
+- **Incremental output** (§5a performance note): rows/blocks accumulate
+  in memory across calls; only the final CSV join / `XLSX.write` step
+  re-runs on each download, not any of the row derivation.
+- **Known gap, not silently downgraded:** spec §5a asks for Sheet 1 to
+  be "formatted as an Excel Table object." The community (free)
+  `xlsx` package can't write real OOXML Table parts — that's a SheetJS
+  Pro feature. Shipped instead with `!autofilter` on the full range
+  plus a frozen header row — sort/filter dropdowns work, range mostly
+  stays stable, but it isn't a true Table object. **Open decision:**
+  accept this as the v1 answer, or take on SheetJS Pro if true Table
+  behaviour turns out to matter once real users are in Excel with it.
+- Verified end to end against real `papaparse`/`xlsx` (not mocked) —
+  CSV block format, block ordering, and the workbook's two sheets all
+  round-tripped correctly through actual `XLSX.read`/`XLSX.write`.
+
+**Still to do:** wire `OutputWriter` into an actual upload UI component
+(`src/features/upload/` is still just a README placeholder — no `.jsx`
+exists yet) and the dual-acknowledgement gate UI itself (`acknowledgeFile`
+already exists in the orchestrator from Phase 3; nothing yet calls it
+from a real "I've saved both files" confirmation control).
+
 ## Phase 5 — Matching logic
 
 **Update:** the match RPCs have since been recovered in full — M1 (org,
