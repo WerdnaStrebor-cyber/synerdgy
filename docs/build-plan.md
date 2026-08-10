@@ -132,6 +132,46 @@ two-phase timing (fileSeq assigned before processing, status updated
 after) doesn't fit one call without either blocking the connection open
 for the duration of hashing or calling it twice under one name anyway.
 
+**RPCs implemented and tested (10 Aug 2026):** all three are live in
+Supabase (migration `phase3_orchestrator_rpcs`), tested end to end
+directly against the database before any client code was written
+against them.
+
+- **Correction against spec §9 caught during implementation:** the
+  original `queue_source_upload` sketch included a `field_mapping`
+  param for server-side storage. This contradicted the already-committed
+  spec §9 decision (no server-side field-mapping storage) and the actual
+  `sources` table has no column for it. Dropped — field mapping stays
+  entirely local, written only into the client-side mapping CSV header
+  block (§5).
+- **`current_party_id(match_id)`** added as a new helper alongside the
+  existing `has_match_access`/`is_own_party` — resolves the calling
+  party (licensor via `auth.uid()`, invitee via the session-local
+  `app.party_id` setting) so the three RPCs below don't have to assume
+  which role is calling.
+- **`sources.status` check constraint updated** to add `ready` as a
+  fourth value (`queued | processing | ready | acknowledged`), per the
+  earlier §3a addendum.
+- **`queue_source_upload(match_id, filename, source_type)`** — assigns
+  `file_seq` atomically via `pg_advisory_xact_lock` scoped to the party
+  id (serialises concurrent calls, prevents two files racing for the
+  same sequence number), inserts the `sources` row as `queued`. Tested:
+  correctly returned `file_seq = '0001'` on first call.
+- **`mark_source_processed(source_id, company_records, contact_records)`**
+  — bulk-inserts via `jsonb_to_recordset`, correlates contact rows to
+  their parent company row by `client_record_id` (unique per record
+  within a match) rather than requiring the client to know
+  `company_hashes.id` in advance, flips status to `ready`. **Real bug
+  caught in testing:** the `jsonb_to_recordset` column-type list used
+  bare `char` instead of `text` for the hash/standardised fields —
+  `char` defaults to `char(1)`, which was silently truncating every
+  multi-character value to its first character. Fixed before this ever
+  reached client code.
+- **`acknowledge_source(source_id)`** — flips `ready → acknowledged`,
+  own ownership check via `is_own_party`. Tested: correctly rejects a
+  call from a party belonging to a different match (`not authorized for
+  this source`).
+
 **Output:** a party can load one or more files, get correct
 non-colliding SYN IDs, and see field-mapping confirmation UI — this is
 the biggest chunk of genuinely new engineering, even though it's built
