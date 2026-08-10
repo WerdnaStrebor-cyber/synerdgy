@@ -1,136 +1,77 @@
 /**
- * Synerdgy — Upload Orchestrator (v2)
- * =====================================
- * Coordinates the full client-side pipeline for a single source file upload.
+ * Synerdgy — Upload Orchestrator (v3 — Exchange multi-file rewrite)
+ * =====================================================================
+ * REWRITTEN 10 Aug 2026. The previous version coordinated exactly one
+ * file at a time, wrote directly to company_hashes via a Supabase
+ * client insert (licensor-only — no invitee path), used a SYN ID format
+ * with no fileSeq segment (the collision bug spec §4 documents), and
+ * had no contact-side processing at all. None of that carries over
+ * structurally; this is a new class built around the session/party
+ * model and the queue/RPC design from this session.
  *
- * Execution sequence:
- *   1. Parse file (CSV or XLSX)
- *   2. Detect fields → present confirmation UI → await user approval
- *      — UNIQUE_ID flagged amber if not detected (non-blocking warning)
- *   3. Process records:
- *        a. Assign sequential SYN ID (SYN_000001 …)
- *        b. Capture client's UNIQUE_ID value for mapping file
- *        c. VHC normalisation          (Module 4)
- *        d. Domain extraction          (Module 3a)
- *        e. Country standardisation    (Module 6)
- *        f. Postcode normalisation     (Module 7)
- *        g. Assemble DerivedRecord
- *   4. Hash + insert to Supabase       (Modules 8 + 9)
- *      — client_record_id (SYN ID) stored alongside hashes
- *   5. Generate mapping CSV → auto-download to browser
- *   6. Trigger mandatory acknowledgement modal
- *   7. On acknowledgement → COMPLETE
+ * Responsibilities:
+ *   - Parse + field-detect each file as the user loads it (human-paced,
+ *     steps 3a-3c — stays on the main thread, unchanged in character
+ *     from before, extended with contact field aliases).
+ *   - On mapping confirmation, call queue_source_upload (assigns
+ *     fileSeq server-side), enqueue the file, dispatch to the worker
+ *     pool.
+ *   - Own a fixed pool of 3 persistent Web Workers (synerdgy-file-
+ *     worker.js does the actual normalisation/hashing — spec §4 off-
+ *     main-thread requirement). Dispatcher always pulls the oldest
+ *     queued file (lowest fileSeq) when a slot frees — see spec §3a.
+ *   - Relay each hashed batch a worker posts back into
+ *     mark_source_processed (batched, only the final batch flips
+ *     status to 'ready' — spec §3a ordering notes).
+ *   - Track per-file status locally (queued | processing | ready |
+ *     acknowledged) so the UI can gate "load another" vs "Done", and
+ *     so canFinish() reflects the real spec §3a rule: all files
+ *     acknowledged, not just queue-empty.
  *
- * Mapping file format:
- *   synerdgy_id, unique_id
- *   SYN_000001, XYZ3456DA
- *   SYN_000002, ABC1234FB
- *   Filename: synerdgy_mapping_[source_name]_[YYYYMMDD].csv
- *
- * State machine:
- *   idle → parsing → awaiting_confirmation → processing → inserting
- *        → mapping_download → awaiting_acknowledgement → complete | error
- *
- * Dependencies:
- *   synerdgy-lookup-loader.js         → window.SynerdgyLookup
- *   synerdgy-vhc-normalizer.js        → window.SynerdgyVHC
- *   synerdgy-country-standardiser.js  → window.SynerdgyCountry
- *   synerdgy-postcode-normaliser.js   → window.SynerdgyPostcode
- *   synerdgy-hash-pipeline.js         → window.SynerdgyHashPipeline
- *   PapaParse (CDN)                   → window.Papa
- *   SheetJS (CDN)                     → window.XLSX
- *   Supabase JS client (CDN)          → window.supabase
+ * Explicitly NOT in scope here (Phase 4, per build plan):
+ *   - Consolidated mapping CSV / lookup workbook generation (spec §5,
+ *     §5a). onFileReady/onFileAcknowledged fire with everything Phase 4
+ *     needs (fileSeq, filename, mapping, record count) but this class
+ *     does not write those files itself.
  *
  * Usage:
- *   const orchestrator = new Orchestrator({
- *     supabase,
- *     tables,           // LookupTables from Module 3b
- *     sourceId,         // project_sources.id for this upload
- *     projectId,        // projects.id
- *     projectCode,      // 5-char hex from projects.project_code e.g. 'A3F7C'
- *     clientCode,       // 5-char hex from clients.client_code e.g. '2A9F1'
- *     sourceName,       // display name for mapping filename e.g. 'Salesforce CRM'
- *     defaultCountry,   // ISO-2 file-level default e.g. 'GB'
- *     onStateChange,    // (state, detail) => void
- *     onProgress,       // (done, total, phase) => void
- *     onMappingReady,   // ({ filename, content, recordCount }) => void
- *                       // — show mandatory modal here
+ *   const session = new Orchestrator({
+ *     supabase, matchId, tables, projectCode, clientCode,
+ *     defaultCountry: 'GB',
+ *     onQueueChange:  (queueSnapshot) => {},
+ *     onFileProgress: (sourceId, done, total) => {},
+ *     onFileReady:    (job) => {},   // show "load another / Done" prompt
+ *     onError:        (sourceId, message) => {},
  *   });
+ *   await session.init();  // loads salt, spawns worker pool
  *
- *   // Step 1
  *   const { mapping, columns, rowCount, uniqueIdWarning }
- *     = await orchestrator.parseAndDetect(file);
+ *     = await session.parseAndDetect(file);
+ *   // ... user confirms mapping in UI ...
+ *   await session.confirmMapping(file, confirmedMapping);
  *
- *   // Step 2 — show confirmation UI, flag amber if uniqueIdWarning
- *   // User confirms, then:
- *   await orchestrator.run(confirmedMapping);
+ *   // later, when user clicks "I've saved my files" for a ready file:
+ *   await session.acknowledgeFile(sourceId);
  *
- *   // Step 3 — onMappingReady fires, show modal
- *   // User clicks "I've saved my mapping file", then:
- *   orchestrator.acknowledgeMapping();
+ *   // gates the "Done" button:
+ *   if (session.canFinish()) { ... }
+ *
+ *   session.destroy();  // terminate workers, call on session end
  */
 
 'use strict';
 
-// UPDATED 10 Aug 2026: these were bare globals (window.SynerdgyHashPipeline
-// etc.) under the old <script>-tag loading model. Now real ES module
-// imports, since the four dependencies were converted alongside this file.
-// NOTE: the fileSeq bug described above and the lack of any multi-file
-// queue model are NOT fixed in this pass — that's separate, larger design
-// work (concurrent processing per spec §3a), deliberately not rushed in
-// alongside this mechanical import fix.
 import * as SynerdgyHashPipeline from './synerdgy-hash-pipeline.js';
-import * as SynerdgyVHC from './synerdgy-vhc-normalizer.js';
-import * as SynerdgyCountry from './synerdgy-country-standardiser.js';
-import * as SynerdgyPostcode from './synerdgy-postcode-normaliser.js';
 
-// ---------------------------------------------------------------------------
-// State constants
-// ---------------------------------------------------------------------------
+const WORKER_POOL_SIZE = 3; // 10 Aug 2026 decision — see spec §3a. Tunable.
 
 const STATES = {
-  IDLE:                     'idle',
-  PARSING:                  'parsing',
-  AWAITING_CONFIRMATION:    'awaiting_confirmation',
-  PROCESSING:               'processing',
-  INSERTING:                'inserting',
-  MAPPING_DOWNLOAD:         'mapping_download',
-  AWAITING_ACKNOWLEDGEMENT: 'awaiting_acknowledgement',
-  COMPLETE:                 'complete',
-  ERROR:                    'error',
+  QUEUED:       'queued',
+  PROCESSING:   'processing',
+  READY:        'ready',
+  ACKNOWLEDGED: 'acknowledged',
+  ERROR:        'error',
 };
-
-// ---------------------------------------------------------------------------
-// SYN ID generator
-// Format: SYN-[5 hex project]-[5 hex client]-[8 hex sequence]
-// Example: SYN-A3F7C-2A9F1-0000A3B4
-// Total length: 24 chars (char(24) in schema)
-//
-// project_code: 5-char hex, derived from sequential project integer → hex
-// client_code:  5-char hex, derived from sequential client integer → hex
-// sequence:     8-char hex, zero-padded record position within this upload
-//
-// Max records per project: 16^8 = 4,294,967,296
-// Max projects:            16^5 = 1,048,576
-// Max clients:             16^5 = 1,048,576
-// ---------------------------------------------------------------------------
-
-function _synId(projectCode, clientCode, sequence) {
-  const seqHex = sequence.toString(16).toUpperCase().padStart(8, '0');
-  return `SYN-${projectCode}-${clientCode}-${seqHex}`;
-}
-
-/**
- * Derive a 5-char uppercase hex code from a sequential integer.
- * Used for both project_code and client_code.
- * e.g. 1 → '00001', 42 → '0002A', 1048575 → 'FFFFF'
- *
- * @param {number} n - Sequential integer from database
- * @returns {string} - 5-char uppercase hex string
- */
-function deriveHexCode(n) {
-  return Math.max(0, Math.floor(n)).toString(16).toUpperCase().padStart(5, '0');
-}
 
 // ---------------------------------------------------------------------------
 // Orchestrator class
@@ -140,171 +81,270 @@ class Orchestrator {
 
   constructor({
     supabase,
+    matchId,
     tables,
-    sourceId,
-    projectId,
-    projectCode,        // 5-char hex — from projects.project_code, fetched at session start
-    clientCode,         // 5-char hex — from clients.client_code, fetched at session start
-    sourceName     = 'source',
-    defaultCountry = 'GB',
-    onStateChange  = () => {},
-    onProgress     = () => {},
-    onMappingReady = () => {},
+    projectCode,
+    clientCode,
+    defaultCountry  = 'GB',
+    workerPoolSize  = WORKER_POOL_SIZE,
+    onQueueChange   = () => {},
+    onFileProgress  = () => {},
+    onFileReady     = () => {},
+    onError         = () => {},
   }) {
-    this.supabase       = supabase;
-    this.tables         = tables;
-    this.sourceId       = sourceId;
-    this.projectId      = projectId;
-    this.projectCode    = String(projectCode).toUpperCase();
-    this.clientCode     = String(clientCode).toUpperCase();
-    this.sourceName     = sourceName;
-    this.defaultCountry = defaultCountry.trim().toUpperCase();
-    this.onStateChange  = onStateChange;
-    this.onProgress     = onProgress;
-    this.onMappingReady = onMappingReady;
+    this.supabase        = supabase;
+    this.matchId          = matchId;
+    this.tables           = tables;
+    this.projectCode      = String(projectCode).toUpperCase();
+    this.clientCode       = String(clientCode).toUpperCase();
+    this.defaultCountry   = defaultCountry.trim().toUpperCase();
+    this.workerPoolSize   = workerPoolSize;
+    this.onQueueChange    = onQueueChange;
+    this.onFileProgress   = onFileProgress;
+    this.onFileReady       = onFileReady;
+    this.onError           = onError;
 
-    this._state         = STATES.IDLE;
-    this._rawRecords    = [];
-    this._mappingRows   = [];   // [{ synId, uniqueId }] — cleared after acknowledgement
-    this._insertResult  = null;
+    this._salt        = null;
+    this._workers      = [];  // [{ worker, busy: bool }]
+    this._queue         = [];  // job objects, see _enqueue()
+    this._pendingUploads = new Map(); // uploadKey -> { rawRecords, columns }
   }
 
   // -------------------------------------------------------------------------
-  // Phase 1: Parse file + detect fields
+  // Setup
+  // -------------------------------------------------------------------------
+
+  async init() {
+    this._salt = await SynerdgyHashPipeline.loadSalt(this.supabase, this.matchId);
+
+    for (let i = 0; i < this.workerPoolSize; i++) {
+      const worker = new Worker(new URL('./synerdgy-file-worker.js', import.meta.url), { type: 'module' });
+      worker.onmessage = (event) => this._handleWorkerMessage(i, event.data);
+      worker.onerror = (event) => {
+        console.error('Orchestrator: worker error', event);
+      };
+      worker.postMessage({
+        type: 'init',
+        tables: this.tables,
+        salt: this._salt,
+        projectCode: this.projectCode,
+        clientCode: this.clientCode,
+        defaultCountry: this.defaultCountry,
+      });
+      this._workers.push({ worker, busy: false, currentSourceId: null });
+    }
+  }
+
+  destroy() {
+    for (const w of this._workers) w.worker.terminate();
+    this._workers = [];
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 1 (per file): Parse + detect fields — human-paced, main thread.
+  // Unchanged in character from the previous version, extended with
+  // contact field aliases.
   // -------------------------------------------------------------------------
 
   /**
    * @param {File} file
-   * @returns {Promise<{
-   *   mapping: FieldMapping,
-   *   columns: string[],
-   *   rowCount: number,
-   *   uniqueIdWarning: boolean
-   * }>}
+   * @returns {Promise<{ mapping, columns, rowCount, uniqueIdWarning, uploadKey }>}
    */
   async parseAndDetect(file) {
-    this._setState(STATES.PARSING, { fileName: file.name });
-    this._rawRecords = [];
+    const rawRecords = await this._parseFile(file);
 
-    try {
-      this._rawRecords = await this._parseFile(file);
-    } catch (err) {
-      this._setState(STATES.ERROR, { message: `Could not parse file: ${err.message}` });
-      throw err;
+    if (rawRecords.length === 0) {
+      throw new Error(`File "${file.name}" appears to be empty.`);
     }
 
-    if (this._rawRecords.length === 0) {
-      this._setState(STATES.ERROR, { message: 'File appears to be empty.' });
-      throw new Error('Empty file');
-    }
-
-    const columns         = Object.keys(this._rawRecords[0]);
-    const mapping         = this._detectFields(columns);
+    const columns         = Object.keys(rawRecords[0]);
+    const mapping          = this._detectFields(columns);
     const uniqueIdWarning = !mapping.UNIQUE_ID;
 
-    if (uniqueIdWarning) {
-      console.warn(
-        'Orchestrator: UNIQUE_ID not detected. ' +
-        'Mapping file will use row numbers as unique_id. ' +
-        'For best results, ensure your file contains your source system ' +
-        'record ID (e.g. Salesforce Account ID) and map it to Unique ID.'
-      );
-    }
+    // Keyed by file name + size + lastModified — good enough to
+    // disambiguate concurrent in-flight files without a server round
+    // trip; the real identity (source_id) is assigned once mapping is
+    // confirmed and queue_source_upload runs.
+    const uploadKey = `${file.name}::${file.size}::${file.lastModified}`;
+    this._pendingUploads.set(uploadKey, { file, rawRecords, columns });
 
-    this._setState(STATES.AWAITING_CONFIRMATION, {
-      mapping,
-      columns,
-      rowCount: this._rawRecords.length,
-      uniqueIdWarning,
-    });
-
-    return { mapping, columns, rowCount: this._rawRecords.length, uniqueIdWarning };
+    return { mapping, columns, rowCount: rawRecords.length, uniqueIdWarning, uploadKey };
   }
 
   // -------------------------------------------------------------------------
-  // Phase 2: Process + insert
+  // Phase 2 (per file): mapping confirmed → queue_source_upload → enqueue
   // -------------------------------------------------------------------------
 
   /**
-   * @param {FieldMapping} confirmedMapping — user-confirmed from UI
-   * @returns {Promise<{ inserted: number, errors: number }>}
+   * @param {string} uploadKey - from parseAndDetect()
+   * @param {FieldMapping} confirmedMapping
    */
-  async run(confirmedMapping) {
-    if (this._state !== STATES.AWAITING_CONFIRMATION) {
-      throw new Error('Orchestrator: call parseAndDetect() before run().');
+  async confirmMapping(uploadKey, confirmedMapping) {
+    const pending = this._pendingUploads.get(uploadKey);
+    if (!pending) {
+      throw new Error(`Orchestrator: no pending upload for key "${uploadKey}" — call parseAndDetect() first.`);
     }
     if (!confirmedMapping?.ORG_NAME) {
       throw new Error('Orchestrator: ORG_NAME must be mapped before processing can start.');
     }
 
-    this._setState(STATES.PROCESSING, { total: this._rawRecords.length });
-
-    let derivedRecords;
-    try {
-      derivedRecords = await this._processRecords(confirmedMapping);
-    } catch (err) {
-      this._setState(STATES.ERROR, { message: `Processing failed: ${err.message}` });
-      throw err;
-    }
-
-    this._setState(STATES.INSERTING, { total: derivedRecords.length });
-
-    try {
-      this._insertResult = await SynerdgyHashPipeline.processAndInsert(
-        this.supabase,
-        this.sourceId,
-        this.projectId,
-        derivedRecords,
-        (done, total) => this.onProgress(done, total, 'inserting'),
-      );
-    } catch (err) {
-      this._setState(STATES.ERROR, { message: `Insert failed: ${err.message}` });
-      throw err;
-    }
-
-    // Raw records no longer needed
-    this._rawRecords = [];
-
-    // Generate mapping file and trigger download
-    this._setState(STATES.MAPPING_DOWNLOAD, {});
-    const mappingFile = this._generateMappingCsv();
-    _triggerDownload(mappingFile.content, mappingFile.filename);
-
-    // Move to awaiting acknowledgement — UI must show mandatory modal
-    this._setState(STATES.AWAITING_ACKNOWLEDGEMENT, {
-      filename:    mappingFile.filename,
-      recordCount: this._mappingRows.length,
-      inserted:    this._insertResult.inserted,
-      errors:      this._insertResult.errors,
+    const ext = pending.file.name.split('.').pop().toLowerCase();
+    const { data, error } = await this.supabase.rpc('queue_source_upload', {
+      p_match_id: this.matchId,
+      p_filename: pending.file.name,
+      p_source_type: ext,
     });
+    if (error) throw new Error(`queue_source_upload failed: ${error.message}`);
 
-    // Fire callback so UI can render the modal
-    this.onMappingReady({
-      filename:    mappingFile.filename,
-      content:     mappingFile.content,
-      recordCount: this._mappingRows.length,
-    });
+    // RPC returns a single-row table result
+    const { source_id: sourceId, file_seq: fileSeq } = Array.isArray(data) ? data[0] : data;
 
-    return this._insertResult;
+    const job = {
+      sourceId,
+      fileSeq,
+      filename: pending.file.name,
+      mapping: confirmedMapping,
+      rawRecords: pending.rawRecords,
+      rowCount: pending.rawRecords.length,
+      status: STATES.QUEUED,
+    };
+
+    this._queue.push(job);
+    this._pendingUploads.delete(uploadKey);
+    this.onQueueChange(this._snapshotQueue());
+    this._dispatch();
+
+    return { sourceId, fileSeq };
   }
 
   // -------------------------------------------------------------------------
-  // Phase 3: User acknowledges mapping modal
-  // Called by UI when user clicks "I've saved my mapping file"
+  // Dispatcher — pulls the oldest queued job (lowest fileSeq) into any
+  // free worker slot. No preemption. Called whenever a job is enqueued
+  // or a worker slot frees up.
   // -------------------------------------------------------------------------
 
-  acknowledgeMapping() {
-    if (this._state !== STATES.AWAITING_ACKNOWLEDGEMENT) {
-      console.warn('Orchestrator: acknowledgeMapping() called in wrong state:', this._state);
+  _dispatch() {
+    const freeSlot = this._workers.findIndex(w => !w.busy);
+    if (freeSlot === -1) return; // pool fully busy — next free slot will re-trigger
+
+    const nextJob = this._queue
+      .filter(j => j.status === STATES.QUEUED)
+      .sort((a, b) => a.fileSeq.localeCompare(b.fileSeq))[0];
+
+    if (!nextJob) return; // nothing waiting
+
+    nextJob.status = STATES.PROCESSING;
+    this._workers[freeSlot].busy = true;
+    this._workers[freeSlot].currentSourceId = nextJob.sourceId;
+    this.onQueueChange(this._snapshotQueue());
+
+    this._workers[freeSlot].worker.postMessage({
+      type: 'process',
+      jobId: nextJob.sourceId,
+      sourceId: nextJob.sourceId,
+      fileSeq: nextJob.fileSeq,
+      mapping: nextJob.mapping,
+      rawRecords: nextJob.rawRecords,
+    });
+
+    // Raw records now live in the worker's copy (structured clone) —
+    // drop the main-thread reference so a large file's rows aren't held
+    // twice in memory for the duration of processing.
+    nextJob.rawRecords = null;
+  }
+
+  // -------------------------------------------------------------------------
+  // Worker message handling
+  // -------------------------------------------------------------------------
+
+  async _handleWorkerMessage(workerIndex, msg) {
+    const job = this._queue.find(j => j.sourceId === msg.sourceId || j.sourceId === msg.jobId);
+
+    if (msg.type === 'progress') {
+      this.onFileProgress(msg.jobId, msg.done, msg.total);
       return;
     }
-    // Clear mapping rows — no longer needed in memory
-    this._mappingRows = [];
-    this._setState(STATES.COMPLETE, this._insertResult);
+
+    if (msg.type === 'batch') {
+      try {
+        const { error } = await this.supabase.rpc('mark_source_processed', {
+          p_source_id: msg.sourceId,
+          p_company_records: msg.companyBatch,
+          p_contact_records: msg.contactBatch,
+          p_final: msg.isFinal,
+        });
+        if (error) throw new Error(error.message);
+      } catch (err) {
+        this._failJob(workerIndex, job, err.message);
+      }
+      return;
+    }
+
+    if (msg.type === 'done') {
+      if (job) job.status = STATES.READY;
+      this._workers[workerIndex].busy = false;
+      this._workers[workerIndex].currentSourceId = null;
+      this.onQueueChange(this._snapshotQueue());
+      if (job) this.onFileReady(job);
+      this._dispatch(); // pull next queued job into this now-free slot
+      return;
+    }
+
+    if (msg.type === 'error') {
+      this._failJob(workerIndex, job, msg.message);
+      return;
+    }
+  }
+
+  _failJob(workerIndex, job, message) {
+    if (job) job.status = STATES.ERROR;
+    this._workers[workerIndex].busy = false;
+    this._workers[workerIndex].currentSourceId = null;
+    this.onQueueChange(this._snapshotQueue());
+    this.onError(job?.sourceId, message);
+    this._dispatch();
   }
 
   // -------------------------------------------------------------------------
-  // File parsing
+  // Phase 3: acknowledge — user confirms both output files saved (3f)
+  // -------------------------------------------------------------------------
+
+  async acknowledgeFile(sourceId) {
+    const job = this._queue.find(j => j.sourceId === sourceId);
+    if (!job) throw new Error(`Orchestrator: no queued job for source ${sourceId}`);
+    if (job.status !== STATES.READY) {
+      throw new Error(`Orchestrator: source ${sourceId} is not ready (status: ${job.status})`);
+    }
+
+    const { error } = await this.supabase.rpc('acknowledge_source', { p_source_id: sourceId });
+    if (error) throw new Error(`acknowledge_source failed: ${error.message}`);
+
+    job.status = STATES.ACKNOWLEDGED;
+    this.onQueueChange(this._snapshotQueue());
+  }
+
+  // -------------------------------------------------------------------------
+  // "Done" gate — spec §3a: blocks on all in-flight processing, not just
+  // an empty queue. Every job must be acknowledged.
+  // -------------------------------------------------------------------------
+
+  canFinish() {
+    return this._queue.length > 0
+      && this._queue.every(j => j.status === STATES.ACKNOWLEDGED);
+  }
+
+  _snapshotQueue() {
+    return this._queue.map(j => ({
+      sourceId: j.sourceId,
+      fileSeq: j.fileSeq,
+      filename: j.filename,
+      rowCount: j.rowCount,
+      status: j.status,
+    }));
+  }
+
+  // -------------------------------------------------------------------------
+  // File parsing (unchanged from previous version)
   // -------------------------------------------------------------------------
 
   _parseFile(file) {
@@ -317,26 +357,19 @@ class Orchestrator {
   _parseCsv(file) {
     return new Promise((resolve, reject) => {
       const records = [];
-      let rowCount  = 0;
 
       Papa.parse(file, {
-        header:         true,
+        header: true,
         skipEmptyLines: true,
-        encoding:       'UTF-8',
-
+        encoding: 'UTF-8',
         step: (result) => {
           if (result.errors.length > 0) {
-            result.errors.forEach(e =>
-              console.warn(`Row ${rowCount + 1} parse warning: ${e.message}`)
-            );
+            result.errors.forEach(e => console.warn(`Parse warning: ${e.message}`));
           }
           records.push(result.data);
-          rowCount++;
-          if (rowCount % 500 === 0) this.onProgress(rowCount, null, 'parsing');
         },
-
         complete: () => resolve(records),
-        error:    (err) => reject(new Error(err.message)),
+        error: (err) => reject(new Error(err.message)),
       });
     });
   }
@@ -349,7 +382,10 @@ class Orchestrator {
   }
 
   // -------------------------------------------------------------------------
-  // Field detection (three-pass — mirrors SimpleFieldMapper in Python)
+  // Field detection (three-pass) — extended 10 Aug 2026 with contact
+  // field aliases (EMAIL, FIRSTNAME, SURNAME, TELEPHONE). The previous
+  // version only detected organisation fields; contact processing did
+  // not exist.
   // -------------------------------------------------------------------------
 
   _detectFields(columns) {
@@ -368,6 +404,22 @@ class Orchestrator {
       'website':                'WEBSITE',
       'webaddress':             'WEBSITE',
       'url':                    'WEBSITE',
+      'email':                  'EMAIL',
+      'emailaddress':           'EMAIL',
+      'email address':          'EMAIL', // 10 Aug 2026: explicit entry —
+      // without this, pass 3's loose substring match let ADDRESS's
+      // 'address' alias claim this column ahead of EMAIL, since
+      // 'address' is legitimately a whole word inside 'email address'.
+      // Pass 1 exact-match resolves it deterministically instead of
+      // relying on pass 3 to guess correctly.
+      'firstname':               'FIRSTNAME',
+      'first name':              'FIRSTNAME',
+      'surname':                 'SURNAME',
+      'lastname':                'SURNAME',
+      'last name':               'SURNAME',
+      'telephone':               'TELEPHONE',
+      'phone':                   'TELEPHONE',
+      'phonenumber':             'TELEPHONE',
     };
 
     const FIELD_ALIASES = {
@@ -387,34 +439,61 @@ class Orchestrator {
                         'internationalnacecode'],
       SIC_DESCRIPTION: ['sic_description', 'industry', 'nace_description',
                         'nace_label', 'lineofbusiness'],
+      EMAIL:           ['email', 'email_address', 'emailaddress', 'e_mail',
+                        'work_email', 'business_email'],
+      FIRSTNAME:       ['firstname', 'first_name', 'fname', 'given_name',
+                        'forename'],
+      SURNAME:         ['surname', 'lastname', 'last_name', 'lname',
+                        'family_name'],
+      TELEPHONE:       ['telephone', 'phone', 'phone_number', 'phonenumber',
+                        'tel', 'mobile', 'contact_number', 'direct_dial'],
     };
 
     const colLower = {};
     for (const col of columns) colLower[col.toLowerCase().trim()] = col;
 
     const mapping = {};
+    // 10 Aug 2026 fix: track which original columns are already claimed,
+    // across ALL standard fields — not just per-field. Previously each
+    // std field ran its own independent search and could claim a column
+    // another field had already claimed (e.g. 'Email Address' matched
+    // both ADDRESS and EMAIL via the pass-3 substring check, since
+    // 'address' is a substring of 'email address'). One physical column
+    // must map to at most one standard field.
+    const claimedColumns = new Set();
 
     // Pass 1: exact known column names
     for (const [lowerKey, orig] of Object.entries(colLower)) {
       const std = KNOWN_COLUMNS[lowerKey];
-      if (std && !mapping[std]) mapping[std] = orig;
-    }
-
-    // Pass 2: alias scan
-    for (const [std, aliases] of Object.entries(FIELD_ALIASES)) {
-      if (mapping[std]) continue;
-      for (const alias of aliases) {
-        if (colLower[alias]) { mapping[std] = colLower[alias]; break; }
+      if (std && !mapping[std] && !claimedColumns.has(orig)) {
+        mapping[std] = orig;
+        claimedColumns.add(orig);
       }
     }
 
-    // Pass 3: partial match
+    // Pass 2: alias scan (exact alias match against full column name)
+    for (const [std, aliases] of Object.entries(FIELD_ALIASES)) {
+      if (mapping[std]) continue;
+      for (const alias of aliases) {
+        const orig = colLower[alias];
+        if (orig && !claimedColumns.has(orig)) {
+          mapping[std] = orig;
+          claimedColumns.add(orig);
+          break;
+        }
+      }
+    }
+
+    // Pass 3: partial match — loosest pass, runs last, only considers
+    // columns not already claimed by a tighter match above.
     for (const [std, aliases] of Object.entries(FIELD_ALIASES)) {
       if (mapping[std]) continue;
       outer: for (const [lowerKey, orig] of Object.entries(colLower)) {
+        if (claimedColumns.has(orig)) continue;
         for (const alias of aliases) {
           if (lowerKey.includes(alias) || alias.includes(lowerKey)) {
             mapping[std] = orig;
+            claimedColumns.add(orig);
             break outer;
           }
         }
@@ -423,169 +502,10 @@ class Orchestrator {
 
     return mapping;
   }
-
-  // -------------------------------------------------------------------------
-  // Record processing — full transformation pipeline
-  // -------------------------------------------------------------------------
-
-  async _processRecords(mapping) {
-    const total   = this._rawRecords.length;
-    const derived = [];
-    this._mappingRows = [];
-    let processed = 0;
-
-    for (const record of this._rawRecords) {
-      processed++;
-
-      // a. Assign SYN ID — SYN-[projectCode]-[clientCode]-[8 hex sequence]
-      const synId = _synId(this.projectCode, this.clientCode, processed);
-
-      // b. Capture client UNIQUE_ID — fallback to row number if not mapped
-      const clientUniqueId = mapping.UNIQUE_ID
-        ? String(record[mapping.UNIQUE_ID] ?? '').trim() || String(processed)
-        : String(processed);
-
-      // Store for mapping file — held in memory until modal acknowledged
-      this._mappingRows.push({ synId, uniqueId: clientUniqueId });
-
-      // c. Raw field extraction
-      const orgName  = String(record[mapping.ORG_NAME]    ?? '').trim();
-      const country  = String(record[mapping.COUNTRY]     ?? '').trim();
-      const postcode = String(record[mapping.POSTAL_CODE] ?? '').trim();
-      const website  = String(record[mapping.WEBSITE]     ?? '').trim();
-
-      // d. VHC normalisation (Module 4)
-      const vhc = SynerdgyVHC.normaliseOrg(orgName, this.tables);
-
-      // e. Domain extraction (Module 3a)
-      const domain = this._extractDomain(website);
-
-      // f. Country standardisation (Module 6)
-      const ctry = SynerdgyCountry.standardiseCountry(
-        country || this.defaultCountry,
-        this.tables,
-        this.defaultCountry,
-      );
-
-      // g. Postcode normalisation (Module 7)
-      const pc = SynerdgyPostcode.normalisePostcode(postcode, ctry.iso2, this.tables);
-
-      // h. Assemble DerivedRecord
-      derived.push({
-        clientRecordId: synId,
-        orgExact:       vhc.orgExact,
-        orgAlgo1:       vhc.orgAlgo1,
-        orgAlgo2:       vhc.orgAlgo2,
-        orgAlgo3:       vhc.orgAlgo3,
-        orgAlgo4:       vhc.orgAlgo4,
-        domain,
-        countryIso2:    ctry.iso2,
-        countryDisplay: ctry.displayName,
-        zipStand:       pc.zipStand,
-        partZip:        pc.partZip,
-      });
-
-      if (processed % 500 === 0) {
-        this.onProgress(processed, total, 'processing');
-        await _yield();
-      }
-    }
-
-    this.onProgress(total, total, 'processing');
-    return derived;
-  }
-
-  // -------------------------------------------------------------------------
-  // Mapping CSV generation
-  // -------------------------------------------------------------------------
-
-  _generateMappingCsv() {
-    const date     = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const safeName = this.sourceName
-      .replace(/[^a-zA-Z0-9_\- ]/g, '')
-      .trim()
-      .replace(/\s+/g, '_');
-    const filename = `synerdgy_mapping_${safeName}_${date}.csv`;
-
-    const lines = ['synerdgy_id,unique_id'];
-    for (const { synId, uniqueId } of this._mappingRows) {
-      const safeUniqueId = String(uniqueId).includes(',')
-        ? `"${String(uniqueId).replace(/"/g, '""')}"`
-        : String(uniqueId);
-      lines.push(`${synId},${safeUniqueId}`);
-    }
-
-    return { filename, content: lines.join('\r\n') };
-  }
-
-  // -------------------------------------------------------------------------
-  // Domain extraction (Module 3a — inlined)
-  // -------------------------------------------------------------------------
-
-  _extractDomain(websiteValue) {
-    if (!websiteValue?.trim()) return '';
-
-    let raw = websiteValue.trim().toLowerCase();
-    raw = raw.replace(/^https?:\/\//, '');
-    raw = raw.split('/')[0].split('?')[0].split('#')[0].split(':')[0];
-
-    const parts = raw.split('.');
-    let domain;
-    if (parts.length <= 2) {
-      domain = parts.join('.');
-    } else {
-      const secondLevel = parts[parts.length - 2];
-      const SECOND_LEVEL_TLDS = new Set(['co', 'com', 'org', 'net', 'gov', 'ac', 'me']);
-      domain = (SECOND_LEVEL_TLDS.has(secondLevel) && parts.length >= 3)
-        ? parts.slice(-3).join('.')
-        : parts.slice(-2).join('.');
-    }
-
-    return this.tables.freeDomains.has(domain) ? '' : domain;
-  }
-
-  // -------------------------------------------------------------------------
-  // State management
-  // -------------------------------------------------------------------------
-
-  _setState(state, detail = {}) {
-    this._state = state;
-    console.log(`Orchestrator [${state}]`, detail);
-    this.onStateChange(state, detail);
-  }
-
-  get state() { return this._state; }
-}
-
-// ---------------------------------------------------------------------------
-// Browser download trigger
-// ---------------------------------------------------------------------------
-
-function _triggerDownload(content, filename) {
-  const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href        = url;
-  a.download    = filename;
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => {
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }, 1000);
-}
-
-// ---------------------------------------------------------------------------
-// Yield to browser event loop
-// ---------------------------------------------------------------------------
-
-function _yield() {
-  return new Promise(resolve => setTimeout(resolve, 0));
 }
 
 // ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 
-export { Orchestrator, STATES };
+export { Orchestrator, STATES, WORKER_POOL_SIZE };
