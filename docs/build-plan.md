@@ -154,15 +154,19 @@ was firing on the licensor's party insert too, not just the invitee's —
 violated the `parties_auth_matches_role` check constraint. Fixed by
 explicitly passing `magic_link_token: null` on the licensor insert.
 
-**Also still open:** the actual upload flow (Phase 3/4) will need to
-decide how an invitee's requests carry their identity on every single
-call, given Supabase's connection pooling doesn't guarantee the
-`current_setting('app.party_id')` pattern used in Phase 1's RLS persists
-across requests. Options to weigh then: routing invitee writes through
-`SECURITY DEFINER` RPC functions (token passed as an explicit argument
-each call — sidesteps the pooling issue entirely) versus a PostgREST
-pre-request hook. Not resolved here — Phase 2 only needed read-only
-invitee access, which the RPC pattern already handles fine.
+**Decided (10 Aug 2026):** invitee identity in Phase 3/4 will be carried
+via `SECURITY DEFINER` RPC functions — the token passed as an explicit
+parameter on every call (`invitee_create_source(token, ...)`,
+`invitee_upload_hashes(token, batch)`, `invitee_mark_done(token)`, etc.),
+not via `current_setting()` session state. Chosen over two alternatives
+(anonymous Supabase Auth + custom JWT claims; a PostgREST pre-request
+header hook) because both of those need Supabase dashboard/Management
+API configuration outside what's scriptable via migration — the RPC
+pattern needs nothing beyond what's already proven working
+(`invitee_get_match`). Cost: Phase 3/4 needs one function per invitee
+action rather than reusing generic table calls — but this fits spec §4's
+"batched, not row-by-row" hashing requirement naturally, since a batch
+upload is one function call either way.
 
 **Output:** a licensor can log in; an invited party can access their
 match via a magic link; the system knows which type of match this is.
