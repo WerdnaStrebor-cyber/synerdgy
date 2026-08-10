@@ -188,6 +188,55 @@ point, not a drop-in." Concretely:
   (per this session's earlier discussion) — this doesn't exist in the
   current orchestrator at all.
 
+**Update (10 Aug 2026) — actual file review completed.** All six engine
+pack files read in full (~2,700 lines). Findings, more favourable than
+the cautious framing above suggested:
+
+- **`vhc-normalizer.js`, `country-standardiser.js`,
+  `postcode-normaliser.js`** — genuinely portable as-is. Pure functions,
+  no DOM/Supabase dependencies beyond the `tables` object. Copied into
+  `src/lib/engine/`, converted from old `window.X = {...}` global-script
+  style to real ES module `import`/`export` (mechanical change, no logic
+  touched), confirmed loading cleanly and the full project still builds.
+- **`hash-pipeline.js`** — already matches spec §4's performance
+  requirements closely (batched, native WebCrypto SHA-256, salt handled
+  correctly). Updated table/column references for the new schema
+  (`projects`→`matches`, `project_sources`→`sources`, added `party_id`/
+  `match_id` to the insert). Converted to ES module. **Not yet wired for
+  invitee uploads** — still does a direct table insert, fine for the
+  licensor (real `auth.uid()`), but per the 10 Aug decision, invitee
+  writes need a `SECURITY DEFINER` RPC instead. That RPC doesn't exist
+  yet — deliberately deferred to the orchestrator rework below, since
+  they're tightly coupled.
+- **`orchestrator.js`** — confirmed the `fileSeq` bug exactly as
+  suspected: `_processRecords()`'s `processed` counter resets to 0 on
+  every call, so two files uploaded in the same session collide. Also
+  confirmed: single-file-only design, no queue/concurrency model, no
+  "load another file" vs "Done" distinction at all. Fixed just enough to
+  load correctly as an ES module (proper `import`s for its four
+  dependencies, replacing the old bare-global references) — the actual
+  `fileSeq`/queue rework is real design work, not done in this pass.
+- **`lookup-loader.js`** — the one real surprise. Fetches its seven
+  reference files from `data-compare.com/synerdgy/lookup/` via HTTP
+  Basic Auth — a host entirely outside the Exchange stack. **Decided:**
+  move to a Supabase Storage bucket instead. Bucket `lookup-tables`
+  created (public — these are generic reference files, no PII, identical
+  across every match, so no real benefit to gating them behind auth).
+  Loader rewritten to download from Storage instead of the old Basic
+  Auth fetch, converted to ES module.
+
+**Still open:**
+- The seven actual lookup data files (word handling rules, country maps,
+  postcode patterns, free-domain blocklist) haven't been uploaded to the
+  new bucket yet — need to be sourced from wherever they currently live
+  (likely still retrievable from data-compare.com with existing
+  credentials) and uploaded via the Supabase Dashboard's Storage UI.
+  Nothing in Phase 3 can be tested end-to-end until this happens.
+- The `fileSeq` fix and multi-file queue/concurrency model (spec §3a) —
+  real design work, next session's starting point.
+- The invitee-upload RPC for `company_hashes`/`contact_hashes` inserts —
+  builds alongside the queue rework above.
+
 **Output:** a party can load one or more files, get correct
 non-colliding SYN IDs, and see field-mapping confirmation UI — this is
 the biggest chunk of genuinely new engineering, even though it's built
