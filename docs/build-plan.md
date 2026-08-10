@@ -172,6 +172,113 @@ against them.
   call from a party belonging to a different match (`not authorized for
   this source`).
 
+**Orchestrator client-side rewrite (10 Aug 2026) — engine pack adapted
+to the multi-file queue model, not just Phase 3's earlier mechanical
+ES-module conversion.** Real structural gaps found and fixed, not just
+the planned queue/dispatcher work:
+
+- **No contact processing existed at all.** The inherited orchestrator
+  only ever detected and hashed organisation fields — `contact_hashes`
+  insert was an unimplemented stub. Field detection extended with
+  `EMAIL`/`FIRSTNAME`/`SURNAME`/`TELEPHONE` aliases; a real bug caught
+  in testing here too — the loose partial-match detection pass let
+  `ADDRESS` and `EMAIL` both silently claim the same "Email Address"
+  column (or worse, `ADDRESS` alone claiming it with `EMAIL` going
+  undetected). Fixed with an explicit exact-match entry plus a
+  claimed-columns guard so one physical column can never be
+  double-mapped.
+- **SYN ID format rebuilt** to the fileSeq-inclusive form (spec §4):
+  `SYN-[project]-[client]-[fileSeq]-[recordSeq]`.
+- **`synerdgy-hash-pipeline.js` rewritten as pure, salt-parameterised
+  functions.** The inherited version read a module-scoped session salt
+  set via `window.addEventListener('pagehide', ...)` — breaks entirely
+  inside a Web Worker (no `window`, no shared module state with the
+  main thread). Caught before it became a runtime bug, not after.
+  Direct-insert logic (`processAndInsert` et al.) removed — insertion
+  now goes through `mark_source_processed`, called by the orchestrator
+  on the main thread after a worker posts back a hashed batch.
+- **`synerdgy-file-worker.js` — new file.** Real Web Worker, spawned
+  once per pool slot and reused across files (not per-file). Receives
+  an `init` message once (lookup tables, salt, project/client codes)
+  then a `process` message per file; posts back `progress`/`batch`/
+  `done`/`error`. Batches at 500 records, each batch triggering one
+  `mark_source_processed` call (`p_final` only true on the last one —
+  RPC amended to support this, tested with a real multi-batch call
+  sequence confirming counts accumulate and status only flips once).
+- **`synerdgy-orchestrator.js` rewritten** as a party-level session
+  class: queue of file jobs, fixed 3-worker pool, dispatcher always
+  pulling the oldest queued file (lowest fileSeq) into a freed slot, no
+  preemption. `canFinish()` correctly gates on every job being
+  `acknowledged`, not just an empty queue, per spec §3a.
+- **Verified with a real browser, not just Node.** Vite's static build
+  alone wasn't sufficient proof the `new Worker(new URL(...), { type:
+  'module' })` pattern resolved — a throwaway smoke-test component was
+  built, confirmed a separate worker chunk in `dist/`, then actually
+  run in a browser via `npm run dev`. Full round trip confirmed working
+  (correct SYN ID, correct 64-char hashes, correct batch/progress/done
+  sequence) before this was treated as done.
+
+**Email splitting (10 Aug 2026) — real gap caught against the recovered
+M2 SQL, not part of the original plan.** The initial contact schema
+had one `email` hash column. Checking `synerdgy-match-contact.sql`
+directly showed `contact_exact` joins on `email_name` AND
+`email_domain` both matching, while `contact_email_name` joins on
+`email_name` alone — a single whole-email hash can't support the
+second level at all, since the local part is never separable from an
+opaque hash after the fact. Fixed: `contact_hashes.email` dropped,
+replaced with `email_name`/`email_domain`, split client-side before
+hashing (`synerdgy-file-worker.js`), RPC updated to match. Tested: same
+local part across different domains hashes identically (enables
+`contact_email_name`) while the domains themselves correctly hash
+differently (so `contact_exact` doesn't false-positive).
+
+**Nickname canonicalisation (10 Aug 2026) — `contact_name` match
+level.** User-supplied `nicknames.csv` (270 rows, `canonical,nickname`)
+loaded via a new `LookupLoader._parseNicknames` parser, resolved
+through a new module `synerdgy-firstname-canonicaliser.js`. Two real
+data ambiguities found and handled deliberately, not silently:
+- `sandra` is both its own canonical name and a listed nickname of
+  `alexandra`. Resolver checks "is this literally a canonical name"
+  before "is this someone's nickname" — so `Sandra` always resolves to
+  `sandra`, never `alexandra`.
+- Six nicknames (`chris`, `nicky`, `nat`, `katie`, `kathy`, `kate`) map
+  to 2–4 different canonicals each in the source data — genuinely
+  ambiguous, no way to disambiguate from the nickname alone (`chris`
+  spans christian/christina/christine/christopher). **Decision (10 Aug
+  2026): resolve deterministically to the alphabetically-first
+  candidate, accept some missed matches on these specific ambiguous
+  cases.** Consistent with how org_algo's loose/broad tiers already
+  trade precision for recall — `contact_name` sits below
+  `contact_exact`/`contact_email_name` in the match hierarchy.
+  Multi-candidate hashing (schema + RPC changes to try all candidates
+  at match time) was considered and explicitly deferred as unwarranted
+  complexity for a fallback-tier signal.
+- `contact_hashes.firstname_canonical` added; `mark_source_processed`
+  updated. Tested end to end: `Bob`/`Robert`/`Bobby` all canonicalise
+  to the same hash while their raw `firstname_standardised` values stay
+  distinct — confirmed both via a stubbed-worker round trip and a live
+  RPC call.
+- **`nicknames.csv` must be uploaded to the Supabase `lookup-tables`
+  Storage bucket** alongside the other seven lookup files — an eighth
+  file `LookupLoader.load()` now fetches in parallel with the rest; its
+  absence fails the whole load, not just nickname resolution.
+
+**contact_fuzzy (consonant-skeleton matching) — explicitly parked**, on
+product owner instruction (10 Aug 2026). Needs `firstname_consonants`/
+`surname_consonants` columns and a consonant-skeleton algorithm,
+neither of which exist. Revisit when prioritised — not blocking
+anything else in Phase 3.
+
+**M2 contact-level match support, current state:**
+
+| Level | Status |
+|---|---|
+| `contact_exact` | done |
+| `contact_email_name` | done |
+| `contact_name` | done |
+| `contact_telephone` | done |
+| `contact_fuzzy` | parked |
+
 **Output:** a party can load one or more files, get correct
 non-colliding SYN IDs, and see field-mapping confirmation UI — this is
 the biggest chunk of genuinely new engineering, even though it's built
