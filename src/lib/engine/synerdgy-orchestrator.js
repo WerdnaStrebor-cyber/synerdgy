@@ -227,9 +227,20 @@ class Orchestrator {
       // hashing or carry the full raw row past dispatch). Kept on the
       // job even after rawRecords is dropped below, so onFileReady
       // still has what it needs once processing finishes.
-      uniqueIds: pending.rawRecords.map(
-        r => String(r[confirmedMapping.UNIQUE_ID] ?? '').trim()
-      ),
+      //
+      // 11 Aug 2026 (real smoke test feedback): falls back to the
+      // row's 1-indexed position, per file, whenever there's no usable
+      // value — either no UNIQUE_ID column was mapped at all, or that
+      // specific row's cell is blank. A blank unique_id in the mapping
+      // file gives the party nothing to trace a match back to; a row
+      // number at least lets them count down to the right row in their
+      // own source file, even without a real ID column.
+      uniqueIds: pending.rawRecords.map((r, i) => {
+        const raw = confirmedMapping.UNIQUE_ID
+          ? String(r[confirmedMapping.UNIQUE_ID] ?? '').trim()
+          : '';
+        return raw || String(i + 1);
+      }),
       uploadedAt: new Date().toISOString(),
       rowCount: pending.rawRecords.length,
       status: STATES.QUEUED,

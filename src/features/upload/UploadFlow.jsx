@@ -265,7 +265,8 @@ export function UploadFlow({ matchId, projectCode, clientCode, inviteeToken = nu
           {pending.uniqueIdWarning && (
             <p style={{ color: '#b45309' }}>
               No Unique ID column detected — you can still proceed, but the mapping file's
-              synerdgy_id/unique_id pairing for this file will have blank unique_id values.
+              synerdgy_id/unique_id pairing for this file will use row numbers instead of your
+              own IDs.
             </p>
           )}
 

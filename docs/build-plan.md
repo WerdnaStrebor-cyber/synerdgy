@@ -472,6 +472,49 @@ is explicitly Phase 5's job, not this one. No results/Venn UI exists
 yet either (Phase 6) — `UploadFlow`'s "done" state is a dead end by
 design until those phases land.
 
+**Real smoke test run, 11 Aug 2026 — first genuine end-to-end pass.**
+Everything up to this point had been verified through builds, unit
+tests, and direct SQL against live Supabase — real, but none of it was
+an actual person clicking through the actual app. This was: create a
+match as licensor, open the real invite link, upload a real 1964-row
+CSV as the invitee, confirm mapping, watch it process, download both
+outputs, acknowledge. Genuinely passed — 1964/1964 rows landed
+correctly in both `company_hashes` and `contact_hashes` through the
+real invitee `anon`-key path (not the sandbox's elevated `execute_sql`
+access this session had been using for everything else), SYN IDs
+formatted and incremented correctly, `status` reached `ready` exactly
+as expected. This is the first real confirmation the invitee
+token-auth fix actually works outside a controlled test.
+
+Two things only a real run surfaced, both fixed same session:
+
+- **Blank `unique_id` when no ID column is mapped** — product feedback
+  from watching the real output, not a bug exactly, but a real gap: a
+  blank cell gives the party nothing to trace a row back to. Now falls
+  back to the row's 1-indexed position within its file, both when no
+  `UNIQUE_ID` column is mapped at all and when an individual row's
+  value in a mapped column is blank. Re-verified against a real
+  generated CSV — fallback values `1`, `2`, `3`... appear exactly where
+  blanks would have been.
+- **Frozen header row in the lookup workbook never worked, at all** —
+  attempted fix used the documented `!freeze` property shape from the
+  installed `xlsx` package's own README, which turned out to be wrong
+  or describing an unshipped feature. First attempt looked plausible
+  (matched the documented shape) but produced no `<pane>` element in
+  the actual file. Confirmed two ways, not just inferred: unzipped the
+  generated `.xlsx` and read the raw sheet XML directly (since SheetJS
+  documents some properties as write-only-not-read-back, a round-trip
+  read check alone wasn't reliable here), then found in the installed
+  package's own source that `write_ws_xml_sheetviews` never reads
+  `!freeze` under any circumstance — only right-to-left is handled.
+  Not a config mistake, genuinely unsupported for writing in this
+  library. Dropped rather than left in as dead code that looks like it
+  should work. `!autofilter` (the other half of the original workaround)
+  **is** confirmed genuinely working, same raw-XML method. Net effect:
+  Sheet 1 has working sort/filter dropdowns, no frozen header row, no
+  true Table object — spec §5a's "Excel Table object" ask remains
+  unmet in this library regardless.
+
 ## Phase 5 — Matching logic
 
 **Update:** the match RPCs have since been recovered in full — M1 (org,

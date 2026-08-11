@@ -42,11 +42,13 @@
  * stable range under sort/filter. The community (free) build of
  * SheetJS used here (`xlsx` on npm) cannot write real OOXML Table
  * parts — that's a SheetJS Pro feature. This implementation instead
- * sets `!autofilter` on the full data range plus a frozen header row,
- * which gives sort/filter dropdowns and range stability under normal
- * use but isn't a true Table object. Worth a decision: accept this as
- * the v1 answer, or take on SheetJS Pro if the "true Table object"
- * behaviour turns out to matter in practice.
+ * sets `!autofilter` on the full data range — sort/filter dropdowns
+ * work, but it isn't a true Table object. Frozen header row was also
+ * attempted and doesn't work in this library at all (confirmed against
+ * the raw XML and the library's own source, not just inferred from
+ * docs — see the comment at the `!autofilter` line in
+ * generateLookupWorkbook for the full story); dropped rather than kept
+ * as code that looks like it should work but doesn't.
  *
  * Usage:
  *   const writer = new OutputWriter({ projectCode, clientCode });
@@ -225,13 +227,30 @@ class OutputWriter {
       header: ['synerdgy_id', 'unique_id', 'source_filename', 'fileSeq'],
     });
     // Community SheetJS can't write a true OOXML Table object (see
-    // module header comment) — autofilter + frozen header row is the
-    // closest available proxy for "stays a stable range when sorted."
+    // module header comment) — autofilter is the closest available
+    // proxy for "stays a stable range when sorted," and IS confirmed
+    // working (checked the raw XML the library actually writes, not
+    // just a round-trip through its own reader — see below for why
+    // that check matters).
     if (this._tableRows.length > 0) {
       const lastRow = this._tableRows.length + 1;
       dataSheet['!autofilter'] = { ref: `A1:D${lastRow}` };
     }
-    dataSheet['!freeze'] = { xSplit: 0, ySplit: 1 };
+    // Frozen header row was attempted (`!freeze`) but genuinely doesn't
+    // work with this library, found by the 11 Aug 2026 smoke test —
+    // XLSX.read()'ing the output back always showed `!freeze` as
+    // undefined regardless of what shape was assigned. That could have
+    // been read-support-only (the npm README does list some properties
+    // as "used when generating... but not yet parsed" — write support
+    // without read support), so read-back alone wasn't a reliable
+    // check; confirmed by unzipping the generated .xlsx and reading the
+    // raw sheet XML directly instead. No <pane> element under any
+    // input. Then confirmed in the installed package's own source
+    // (write_ws_xml_sheetviews in node_modules/xlsx/xlsx.js) that it
+    // never reads `!freeze` at all — only right-to-left is handled.
+    // Not implemented for writing in this library, not a config
+    // mistake. Dropped rather than left in as dead code that looks
+    // like it should work.
     XLSX.utils.book_append_sheet(wb, dataSheet, 'Data');
 
     const auditSheet = XLSX.utils.json_to_sheet(this._auditRows, {
